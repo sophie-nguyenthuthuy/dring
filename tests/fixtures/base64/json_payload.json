@@ -1,0 +1,5 @@
+{
+  "input": "eyJoZWxsbyI6IndvcmxkIn0=",
+  "expect_type": "base64",
+  "summary_contains": ["JSON"]
+}

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dring"
+version = "0.1.0"
+description = "a decoder ring for opaque strings — paste anything, find out what it is"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Sophie Nguyen Thu Thuy", email = "sophie.nguyenthuthuy@gmail.com" }]
+keywords = ["decoder", "jwt", "ulid", "protobuf", "cron", "magic-bytes", "cli"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Environment :: Console",
+    "Topic :: Utilities",
+]
+
+[project.scripts]
+dring = "dring.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/sophie-nguyenthuthuy/dring"
+
+[tool.setuptools.packages.find]
+include = ["dring*"]

@@ -1,0 +1,5 @@
+{
+  "input": "89504E470D0A1A0A",
+  "expect_type": "magicbytes",
+  "summary_contains": ["PNG"]
+}

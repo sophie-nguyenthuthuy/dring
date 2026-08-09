@@ -1,0 +1,5 @@
+{
+  "input": "-----BEGIN CERTIFICATE-----",
+  "expect_type": "magicbytes",
+  "summary_contains": ["PEM", "CERTIFICATE"]
+}

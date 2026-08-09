@@ -1,0 +1,6 @@
+{
+  "input": "01890a5d-ac96-774b-bcce-b302099a8057",
+  "expect_type": "uuid",
+  "summary_contains": ["UUID v7", "2023"],
+  "details": {"version": 7}
+}

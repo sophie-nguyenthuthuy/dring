@@ -1,0 +1,5 @@
+{
+  "input": "*/5 * * * *",
+  "expect_type": "cron",
+  "summary_contains": ["every 5 minutes"]
+}

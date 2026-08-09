@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dring — a decoder ring for opaque strings</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --card: #ffffff; --ink: #1a1a1a; --muted: #6b6b6b;
+    --accent: #b45309; --line: #e4e4e0; --pill: #f1ede6; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #16161a; --card: #1f1f24; --ink: #ecece8; --muted: #9a9a94;
+            --accent: #f59e0b; --line: #2c2c32; --pill: #2a2a30; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 780px; margin: 0 auto; padding: 40px 20px 80px; }
+  h1 { font-size: 1.7rem; margin: 0 0 4px; }
+  h1 .ring { color: var(--accent); }
+  .tag { color: var(--muted); margin: 0 0 24px; }
+  textarea { width: 100%; min-height: 110px; padding: 14px; border: 1.5px solid var(--line);
+             border-radius: 10px; background: var(--card); color: var(--ink);
+             font: 14px/1.5 var(--mono); resize: vertical; }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 28px; }
+  .chips button { border: 1px solid var(--line); background: var(--pill); color: var(--ink);
+                  border-radius: 999px; padding: 4px 12px; font-size: 12.5px; cursor: pointer; }
+  .chips button:hover { border-color: var(--accent); }
+  .card { background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+          border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; }
+  .card h3 { margin: 0 0 6px; font-size: 1rem; display: flex; align-items: center; gap: 10px; }
+  .conf { font-size: 11.5px; font-weight: 600; color: var(--accent); background: var(--pill);
+          border-radius: 999px; padding: 2px 9px; }
+  .type { font-family: var(--mono); font-size: 13px; color: var(--muted); }
+  dl { margin: 8px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; font-size: 13.5px; }
+  dt { color: var(--muted); font-family: var(--mono); }
+  dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+  .empty { color: var(--muted); font-style: italic; }
+  footer { margin-top: 40px; font-size: 13.5px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 16px; }
+  footer code { font-family: var(--mono); background: var(--pill); padding: 1px 5px; border-radius: 5px; }
+</style>
+</head>
+<body>
+<main>
+  <h1><span class="ring">◎</span> dring</h1>
+  <p class="tag">a decoder ring for opaque strings — paste anything, find out what it is. Fully offline: nothing leaves this page.</p>
+
+  <textarea id="in" placeholder="paste a JWT, ULID, cron expression, hex dump, pod name, stack trace…" autofocus spellcheck="false"></textarea>
+
+  <div class="chips" id="chips"></div>
+  <div id="out"><p class="empty">candidates appear here as you type</p></div>
+
+  <footer>
+    Every detector is one regex + one parser + one fixture — PRs welcome.
+    CLI: <code>dring &lt;string&gt;</code> · stdlib-only Python, same detectors as this page.
+  </footer>
+</main>
+<script>
+"use strict";
+// ---------- helpers ----------
+const pad = s => s + "=".repeat((4 - s.length % 4) % 4);
+function b64uBytes(s) {
+  const bin = atob(pad(s).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(bin, c => c.charCodeAt(0));
+}
+function utf8(bytes) {
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { return null; }
+}
+function isoS(sec) {
+  const d = new Date(sec * 1000);
+  if (isNaN(d)) return null;
+  return d.toISOString().replace(".000Z", "Z");
+}
+const isoMs = ms => isoS(ms / 1000);
+function plausible(sec, lo = 1980, hi = 2100) {
+  const y = new Date(sec * 1000).getUTCFullYear();
+  return !isNaN(y) && y >= lo && y <= hi;
+}
+function hexBytes(s) {
+  let t = s.trim().replace(/[\s:,]/g, "");
+  if (/^0x/i.test(t)) t = t.slice(2);
+  if (t.length < 2 || t.length % 2 || !/^[0-9a-fA-F]+$/.test(t)) return null;
+  const out = new Uint8Array(t.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(t.substr(i * 2, 2), 16);
+  return out;
+}
+const toHex = (b, n) => [...b.slice(0, n)].map(x => x.toString(16).padStart(2, "0")).join("");
+
+// ---------- protobuf wire walker ----------
+function pbVarint(b, i) {
+  let shift = 0n, v = 0n;
+  for (let k = 0; k < 10; k++) {
+    if (i >= b.length) return [null, i];
+    const byte = BigInt(b[i]); i++;
+    v |= (byte & 0x7Fn) << shift;
+    if (!(byte & 0x80n)) return [v, i];
+    shift += 7n;
+  }
+  return [null, i];
+}
+function pbParse(b) {
+  let i = 0; const fields = [];
+  while (i < b.length) {
+    if (fields.length > 200) return null;
+    let key; [key, i] = pbVarint(b, i);
+    if (key === null) return null;
+    const fn = key >> 3n, wt = key & 7n;
+    if (fn === 0n || fn > 536870911n) return null;
+    if (wt === 0n) { let v; [v, i] = pbVarint(b, i); if (v === null) return null; fields.push([fn, "varint", v]); }
+    else if (wt === 1n) { if (i + 8 > b.length) return null; fields.push([fn, "fixed64", toHex(b.slice(i, i + 8), 8)]); i += 8; }
+    else if (wt === 2n) {
+      let ln; [ln, i] = pbVarint(b, i);
+      if (ln === null || i + Number(ln) > b.length) return null;
+      fields.push([fn, "len", b.slice(i, i + Number(ln))]); i += Number(ln);
+    }
+    else if (wt === 5n) { if (i + 4 > b.length) return null; fields.push([fn, "fixed32", toHex(b.slice(i, i + 4), 4)]); i += 4; }
+    else return null;
+  }
+  return fields.length ? fields : null;
+}
+function pbRender(fields) {
+  return fields.map(([fn, wt, v]) => {
+    if (wt === "len") {
+      const t = utf8(v);
+      if (t !== null && ![...t].some(c => c.charCodeAt(0) < 32 && !"\n\r\t".includes(c)))
+        return `field ${fn} (len ${v.length}) = "${t.slice(0, 60)}"`;
+      return `field ${fn} (len ${v.length}) = 0x${toHex(v, 24)}`;
+    }
+    return `field ${fn} (${wt}) = ${v}`;
+  });
+}
+
+// ---------- detectors ----------
+const detectors = [];
+const reg = (name, fn) => detectors.push({ name, fn });
+
+reg("jwt", s => {
+  if (!/^[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*$/.test(s)) return null;
+  const [h, p, sig] = s.split(".");
+  let header, claims;
+  try { header = JSON.parse(utf8(b64uBytes(h))); claims = JSON.parse(utf8(b64uBytes(p))); }
+  catch { return null; }
+  if (typeof header !== "object" || header === null || !header.alg) return null;
+  const d = { alg: header.alg };
+  if (header.typ) d.typ = header.typ;
+  d.claims = JSON.stringify(claims);
+  if (claims && typeof claims === "object")
+    for (const k of ["iat", "nbf", "exp"])
+      if (typeof claims[k] === "number") d[k + "_human"] = isoS(claims[k]);
+  let sum = `JWT signed with ${header.alg}`;
+  if (claims && claims.sub) sum += `, sub=${claims.sub}`;
+  return { conf: sig ? 0.98 : 0.9, summary: sum, details: d };
+});
+
+const CROCK = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+reg("ulid", s => {
+  if (!/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(s)) return null;
+  let ms = 0;
+  for (const ch of s.slice(0, 10)) ms = ms * 32 + CROCK.indexOf(ch);
+  const iso = isoMs(ms);
+  return { conf: 0.9, summary: `ULID created ${iso}`,
+           details: { timestamp_ms: ms, timestamp_iso: iso, randomness: s.slice(10) } };
+});
+
+reg("uuid", s => {
+  s = s.toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(s)) return null;
+  const v = parseInt(s[14], 16);
+  const d = { version: v, variant_nibble: s[19] };
+  let sum = `UUID v${v}`;
+  if (v === 1) {
+    const t100 = (BigInt("0x" + (parseInt(s.slice(14, 18), 16) & 0x0FFF).toString(16)) << 48n)
+               | (BigInt(parseInt(s.slice(9, 13), 16)) << 32n) | BigInt(parseInt(s.slice(0, 8), 16));
+    const iso = isoS(Number(t100) / 1e7 - 12219292800);
+    d.timestamp_iso = iso; d.node = s.slice(24); sum += ` (time-based), created ${iso}`;
+  } else if (v === 4) sum += " (random)";
+  else if (v === 7) {
+    const iso = isoMs(parseInt(s.slice(0, 8) + s.slice(9, 13), 16));
+    d.timestamp_iso = iso; sum += ` (unix-time-ordered), created ${iso}`;
+  }
+  return { conf: 0.95, summary: sum, details: d };
+});
+
+reg("unixtime", s => {
+  if (!/^\d{9,19}$/.test(s)) return null;
+  const n = Number(s), out = [];
+  for (const [unit, div] of [["seconds", 1], ["milliseconds", 1e3], ["microseconds", 1e6], ["nanoseconds", 1e9]]) {
+    const sec = n / div;
+    if (!plausible(sec)) continue;
+    const iso = isoS(sec);
+    out.push({ conf: unit === "seconds" ? 0.65 : 0.6,
+               summary: `unix timestamp (${unit}): ${iso}`, details: { unit, utc: iso } });
+  }
+  return out.length ? out : null;
+});
+
+reg("snowflake", s => {
+  if (!/^\d{17,19}$/.test(s)) return null;
+  const n = BigInt(s), out = [];
+  for (const [origin, epoch] of [["Discord", 1420070400000n], ["Twitter", 1288834974657n]]) {
+    const ms = Number((n >> 22n) + epoch);
+    const y = new Date(ms).getUTCFullYear();
+    if (isNaN(y) || y < 2010 || y > 2035) continue;
+    out.push({ conf: 0.6, summary: `possible snowflake ID (${origin} epoch): ${isoMs(ms)}`,
+               details: { epoch: origin, timestamp_iso: isoMs(ms),
+                          worker: Number((n >> 17n) & 0x1Fn), process: Number((n >> 12n) & 0x1Fn),
+                          sequence: Number(n & 0xFFFn) } });
+  }
+  return out.length ? out : null;
+});
+
+reg("objectid", s => {
+  s = s.toLowerCase();
+  if (!/^[0-9a-f]{24}$/.test(s)) return null;
+  const ts = parseInt(s.slice(0, 8), 16), iso = isoS(ts);
+  const ok = iso && plausible(ts, 2000, 2035);
+  return { conf: ok ? 0.75 : 0.35,
+           summary: ok ? `MongoDB ObjectId created ${iso}` : "24 hex chars (ObjectId shape, timestamp implausible)",
+           details: { timestamp_iso: iso, machine_pid: s.slice(8, 18), counter: s.slice(18) } };
+});
+
+const HASHLEN = { 32: "MD5", 40: "SHA-1 (or a git object id)", 56: "SHA-224", 64: "SHA-256", 96: "SHA-384", 128: "SHA-512" };
+reg("hexdigest", s => {
+  if (!/^[0-9a-fA-F]+$/.test(s) || !(s.length in HASHLEN)) return null;
+  const algo = HASHLEN[s.length];
+  return { conf: 0.5, summary: `${algo} digest (${s.length * 4} bits)`, details: { algorithm: algo, bits: s.length * 4 } };
+});
+
+reg("base64", s => {
+  if (s.length < 8 || /[\s]/.test(s)) return null;
+  const std = /^[A-Za-z0-9+/]+={0,2}$/.test(s) && s.length % 4 === 0;
+  const url = /^[A-Za-z0-9_-]+={0,2}$/.test(s) && s.length % 4 !== 1;
+  if (!std && !url) return null;
+  let data;
+  try { data = b64uBytes(s.replace(/\+/g, "-").replace(/\//g, "_")); } catch { return null; }
+  if (!data.length) return null;
+  let summary, preview, conf;
+  const starts = (m) => m.every((x, i) => data[i] === x);
+  if (starts([0x1f, 0x8b])) [summary, preview, conf] = ["base64-encoded gzip data", toHex(data, 8), 0.85];
+  else if (starts([0x89, 0x50, 0x4e, 0x47])) [summary, preview, conf] = ["base64-encoded PNG image", toHex(data, 8), 0.85];
+  else if (starts([0x25, 0x50, 0x44, 0x46])) [summary, preview, conf] = ["base64-encoded PDF document", toHex(data, 8), 0.85];
+  else if (starts([0x50, 0x4b, 0x03, 0x04])) [summary, preview, conf] = ["base64-encoded ZIP archive", toHex(data, 8), 0.85];
+  else {
+    const text = utf8(data);
+    const printable = text !== null && ![...text].some(c => c.charCodeAt(0) < 32 && !"\n\r\t".includes(c));
+    if (printable) {
+      const t = text.trim();
+      let isJson = false;
+      if ("{[".includes(t[0])) { try { JSON.parse(t); isJson = true; } catch {} }
+      [summary, preview, conf] = isJson ? ["base64-encoded JSON", t.slice(0, 120), 0.85]
+                                        : ["base64-encoded text", t.slice(0, 120), 0.75];
+    } else {
+      const fields = data.length >= 4 ? pbParse(data) : null;
+      if (fields) [summary, preview, conf] =
+        [`base64-encoded, decodes as protobuf (${fields.length} fields)`, pbRender(fields).slice(0, 5).join("; "), 0.6];
+      else [summary, preview, conf] = [`base64 of ${data.length} bytes of binary`, toHex(data, 24), 0.3];
+    }
+  }
+  if (/^[0-9a-fA-F]+$/.test(s)) conf *= 0.4;
+  return { conf, summary, details: { bytes: data.length, decoded: preview } };
+});
+
+reg("protobuf", s => {
+  const data = hexBytes(s);
+  if (!data || data.length < 2) return null;
+  const fields = pbParse(data);
+  if (!fields) return null;
+  return { conf: 0.65, summary: `protobuf wire format (${fields.length} field${fields.length !== 1 ? "s" : ""})`,
+           details: { fields: pbRender(fields).join(" · ") } };
+});
+
+const CRON_FIELDS = [
+  ["minute", 0, 59, null], ["hour", 0, 23, null], ["day-of-month", 1, 31, null],
+  ["month", 1, 12, { JAN: 1, FEB: 2, MAR: 3, APR: 4, MAY: 5, JUN: 6, JUL: 7, AUG: 8, SEP: 9, OCT: 10, NOV: 11, DEC: 12 }],
+  ["day-of-week", 0, 7, { SUN: 0, MON: 1, TUE: 2, WED: 3, THU: 4, FRI: 5, SAT: 6 }],
+];
+const CRON_ALIASES = { "@yearly": "0 0 1 1 *", "@annually": "0 0 1 1 *", "@monthly": "0 0 1 * *",
+                       "@weekly": "0 0 * * 0", "@daily": "0 0 * * *", "@midnight": "0 0 * * *", "@hourly": "0 * * * *" };
+function cronPartOk(part, lo, hi, names) {
+  part = part.toUpperCase();
+  for (const [nm, val] of Object.entries(names || {})) part = part.replaceAll(nm, String(val));
+  const m = /^(\*|\d+|\d+-\d+)(?:\/(\d+))?$/.exec(part);
+  if (!m) return false;
+  const [, rng, step] = m;
+  if (step !== undefined && +step === 0) return false;
+  if (rng === "*") return true;
+  if (rng.includes("-")) { const [a, b] = rng.split("-").map(Number); return lo <= a && a <= b && b <= hi; }
+  return lo <= +rng && +rng <= hi;
+}
+reg("cron", s => {
+  let alias = null;
+  if (s.toLowerCase() in CRON_ALIASES) { alias = s; s = CRON_ALIASES[s.toLowerCase()]; }
+  const parts = s.split(/\s+/);
+  let fields;
+  if (parts.length === 6) fields = [["second", 0, 59, null], ...CRON_FIELDS];
+  else if (parts.length === 5) fields = CRON_FIELDS;
+  else return null;
+  const d = {};
+  for (let i = 0; i < parts.length; i++) {
+    const [name, lo, hi, names] = fields[i];
+    if (!parts[i].split(",").every(p => p && cronPartOk(p, lo, hi, names))) return null;
+    const desc = parts[i] === "*" ? "any" : parts[i].startsWith("*/") ? `every ${parts[i].slice(2)}` : parts[i];
+    d[name] = `${parts[i]} (${desc})`;
+  }
+  const minute = parts[parts.length - 5], rest = parts.slice(-4);
+  let human = "schedule (see fields)";
+  if (rest.every(x => x === "*") && minute.startsWith("*/")) human = `every ${minute.slice(2)} minutes`;
+  else if (parts.every(x => x === "*")) human = "every minute";
+  return { conf: 0.85, summary: `cron expression: ${human}` + (alias ? ` (alias ${alias})` : ""), details: d };
+});
+
+const MAGICS = [
+  ["FD377A585A00", "xz compressed data"], ["377ABCAF271C", "7-Zip archive"],
+  ["89504E47", "PNG image"], ["47494638", "GIF image"], ["25504446", "PDF document"],
+  ["504B0304", "ZIP archive (also docx/xlsx/jar/apk)"], ["7F454C46", "ELF executable"],
+  ["CFFAEDFE", "Mach-O 64-bit executable (little-endian)"], ["FEEDFACF", "Mach-O 64-bit executable"],
+  ["CAFEBABE", "Java class file (or Mach-O fat binary)"], ["0061736D", "WebAssembly module"],
+  ["53514C69", "SQLite database"], ["52617221", "RAR archive"], ["4F676753", "Ogg container"],
+  ["52494646", "RIFF container (WAV/AVI/WebP)"], ["FFD8FF", "JPEG image"],
+  ["425A68", "bzip2 compressed data"], ["494433", "MP3 audio (ID3 tag)"],
+  ["1F8B", "gzip compressed data"], ["4D5A", "Windows PE executable (MZ)"],
+];
+const TEXT_MAGICS = [["-----BEGIN ", "PEM block"], ["%PDF-", "PDF document"],
+                     ["SQLite format 3", "SQLite database"], ["{\\rtf", "RTF document"], ["#!", "script with a shebang"]];
+reg("magicbytes", s => {
+  for (const [prefix, name] of TEXT_MAGICS) {
+    if (s.startsWith(prefix)) {
+      let summary = name;
+      if (name === "PEM block") {
+        const label = s.slice(prefix.length).split("-----")[0].trim();
+        if (label) summary = `PEM block (${label})`;
+      }
+      return { conf: 0.9, summary, details: { matched_prefix: prefix.trim() } };
+    }
+  }
+  const data = hexBytes(s);
+  if (!data) return null;
+  const hx = toHex(data, data.length).toUpperCase();
+  for (const [prefix, name] of MAGICS)
+    if (hx.startsWith(prefix))
+      return { conf: 0.8, summary: `${name} (magic ${prefix})`, details: { magic: prefix, bytes_shown: data.length } };
+  return null;
+});
+
+reg("k8s", s => {
+  const m = /^([a-z0-9][a-z0-9-]*?)-([bcdfghjklmnpqrstvwxz2456789]{8,10})-([bcdfghjklmnpqrstvwxz2456789]{5})$/.exec(s);
+  if (!m) return null;
+  const [, name, hash, suffix] = m;
+  return { conf: 0.75,
+           summary: `Kubernetes pod: Deployment '${name}' → ReplicaSet '${name}-${hash}' → pod '${suffix}'`,
+           details: { deployment: name, pod_template_hash: hash, pod_suffix: suffix } };
+});
+
+const TRACE_SIGS = [
+  ["Python", /Traceback \(most recent call last\)/, /^\s+File "/gm],
+  ["Go", /^goroutine \d+ \[/m, /^\S+\(.*\)$/gm],
+  ["Rust", /thread '[^']*' panicked at/, /^\s+\d+: /gm],
+  ["Java", /^\s+at [\w.$<>]+\([\w$]+\.(java|kt):\d+\)/m, /^\s+at /gm],
+  ["JavaScript", /^\s+at .+:\d+:\d+\)?$/m, /^\s+at /gm],
+];
+reg("stacktrace", s => {
+  if (!s.includes("\n")) return null;
+  const lines = s.split("\n").filter(l => l.trim());
+  for (const [lang, sig, frame] of TRACE_SIGS) {
+    if (!sig.test(s)) continue;
+    const error = (lang === "Python" ? lines[lines.length - 1] : lines[0]).trim();
+    return { conf: 0.9, summary: `${lang} stack trace: ${error.slice(0, 100)}`,
+             details: { language: lang, frames: (s.match(frame) || []).length, error: error.slice(0, 200) } };
+  }
+  return null;
+});
+
+reg("semver", s => {
+  const m = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/.exec(s);
+  if (!m) return null;
+  const [, major, minor, patch, pre, build] = m;
+  const d = { major: +major, minor: +minor, patch: +patch };
+  if (pre) d.prerelease = pre;
+  if (build) d.build = build;
+  return { conf: 0.5,
+           summary: `semantic version ${major}.${minor}.${patch}` + (pre ? `-${pre} (prerelease)` : ""), details: d };
+});
+
+// ---------- identify + render ----------
+function identify(text) {
+  text = text.trim();
+  if (!text) return [];
+  const out = [];
+  for (const { name, fn } of detectors) {
+    let r = null;
+    try { r = fn(text); } catch {}
+    if (!r) continue;
+    for (const c of Array.isArray(r) ? r : [r]) out.push({ type: name, ...c });
+  }
+  return out.sort((a, b) => b.conf - a.conf);
+}
+
+const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+function render() {
+  const cands = identify(document.getElementById("in").value);
+  const out = document.getElementById("out");
+  if (!cands.length) {
+    out.innerHTML = `<p class="empty">${document.getElementById("in").value.trim()
+      ? `no idea — ran ${detectors.length} detectors, none matched. Add one: a detector is one regex + one parser + one fixture.`
+      : "candidates appear here as you type"}</p>`;
+    return;
+  }
+  out.innerHTML = cands.map(c => `
+    <div class="card">
+      <h3><span class="type">${esc(c.type)}</span> ${esc(c.summary)}
+          <span class="conf">${Math.round(c.conf * 100)}%</span></h3>
+      <dl>${Object.entries(c.details || {}).map(([k, v]) =>
+        `<dt>${esc(k)}</dt><dd>${esc(typeof v === "object" ? JSON.stringify(v) : v)}</dd>`).join("")}</dl>
+    </div>`).join("");
+}
+document.getElementById("in").addEventListener("input", render);
+
+// ---------- example chips ----------
+const EXAMPLES = [
+  ["JWT", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"],
+  ["ULID", "01ARZ3NDEKTSV4RRFFQ69G5FAV"],
+  ["UUID v7", "01890a5d-ac96-774b-bcce-b302099a8057"],
+  ["cron", "*/5 * * * *"],
+  ["k8s pod", "nginx-7d9fd8c5b7-2xkq9"],
+  ["PNG magic", "89504E470D0A1A0A"],
+  ["protobuf hex", "089601"],
+  ["snowflake", "175928847299117063"],
+  ["base64 JSON", "eyJoZWxsbyI6IndvcmxkIn0="],
+  ["timestamp", "1700000000"],
+  ["Python trace", 'Traceback (most recent call last):\n  File "app.py", line 7, in main\n    return 1 / 0\nZeroDivisionError: division by zero'],
+];
+document.getElementById("chips").innerHTML =
+  EXAMPLES.map(([label], i) => `<button data-i="${i}">${esc(label)}</button>`).join("");
+document.getElementById("chips").addEventListener("click", e => {
+  const i = e.target.dataset.i;
+  if (i === undefined) return;
+  document.getElementById("in").value = EXAMPLES[i][1];
+  render();
+});
+</script>
+</body>
+</html>

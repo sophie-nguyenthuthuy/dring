@@ -1,0 +1,6 @@
+{
+  "input": "nginx-7d9fd8c5b7-2xkq9",
+  "expect_type": "k8s",
+  "summary_contains": ["Kubernetes"],
+  "details": {"deployment": "nginx", "pod_template_hash": "7d9fd8c5b7"}
+}

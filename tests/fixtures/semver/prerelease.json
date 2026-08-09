@@ -1,0 +1,5 @@
+{
+  "input": "1.2.3-rc.1",
+  "expect_type": "semver",
+  "summary_contains": ["semantic version"]
+}

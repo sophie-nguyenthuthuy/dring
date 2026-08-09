@@ -1,0 +1,6 @@
+{
+  "input": "089601",
+  "expect_type": "protobuf",
+  "summary_contains": ["protobuf"],
+  "details": {"fields": ["field 1 (varint) = 150"]}
+}

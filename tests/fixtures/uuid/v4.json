@@ -1,0 +1,6 @@
+{
+  "input": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "expect_type": "uuid",
+  "summary_contains": ["UUID v4", "random"],
+  "details": {"version": 4}
+}

@@ -1,0 +1,6 @@
+{
+  "input": "Traceback (most recent call last):\n  File \"app.py\", line 10, in <module>\n    main()\n  File \"app.py\", line 7, in main\n    return 1 / 0\nZeroDivisionError: division by zero",
+  "expect_type": "stacktrace",
+  "summary_contains": ["Python", "ZeroDivisionError"],
+  "details": {"language": "Python", "frames": 2}
+}
